@@ -17,6 +17,22 @@ import torch
 
 from vllm.utils import is_pin_memory_available
 
+_CALLBACK_KEEPER = None
+_C_INIT_DONE = False
+
+
+def _assert_same_instance(curr_cb, kept_cb):
+    curr_self = getattr(curr_cb, "__self__", object())
+    kept_self = getattr(kept_cb, "__self__", object())
+    if curr_self is not kept_self:
+        raise RuntimeError(
+            "Callbacks captured from a different CuMemAllocator instance"
+        )
+    curr_func = getattr(curr_cb, "__func__", curr_cb)
+    kept_func = getattr(kept_cb, "__func__", kept_cb)
+    if curr_func is not kept_func:
+        raise RuntimeError("Different callback function object supplied")
+
 
 def find_loaded_library(lib_name) -> Optional[str]:
     """
@@ -86,7 +102,18 @@ def get_pluggable_allocator(
                                int], python_free_func: Callable[[int, int],
                                                                 None]
 ) -> torch.cuda.memory.CUDAPluggableAllocator:
-    init_module(python_malloc_fn, python_free_func)
+    global _CALLBACK_KEEPER
+    global _C_INIT_DONE
+    if _CALLBACK_KEEPER is None:
+        _CALLBACK_KEEPER = (python_malloc_fn, python_free_func)
+    else:
+        kept_malloc, kept_free = _CALLBACK_KEEPER
+        _assert_same_instance(python_malloc_fn, kept_malloc)
+        _assert_same_instance(python_free_func, kept_free)
+
+    if not _C_INIT_DONE:
+        init_module(*_CALLBACK_KEEPER)
+        _C_INIT_DONE = True
     new_alloc = torch.cuda.memory.CUDAPluggableAllocator(
         lib_name, 'my_malloc', 'my_free')
     return new_alloc
