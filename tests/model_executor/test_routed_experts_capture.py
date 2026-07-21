@@ -111,14 +111,15 @@ def test_gpu_model_runner_binds_router_capture(monkeypatch):
     class DummyFusedMoE:
         def __init__(self):
             self.layer_id = 7
+            self.sp_size = 3
             self.router = _make_router()
 
     class DummyCapturer:
         def __init__(self):
             self.calls = []
 
-        def capture(self, layer_id, topk_ids):
-            self.calls.append((layer_id, topk_ids))
+        def capture(self, layer_id, topk_ids, sp_size=1):
+            self.calls.append((layer_id, topk_ids, sp_size))
 
     dummy_module = DummyFusedMoE()
 
@@ -140,8 +141,9 @@ def test_gpu_model_runner_binds_router_capture(monkeypatch):
     dummy_module.router.capture_fn(torch.tensor([[5, 6]]))
 
     assert len(capturer.calls) == 1
-    layer_id, topk_ids = capturer.calls[0]
+    layer_id, topk_ids, sp_size = capturer.calls[0]
     assert layer_id == 7
+    assert sp_size == 3  # threaded from module.sp_size
     assert torch.equal(topk_ids, torch.tensor([[5, 6]]))
 
 
@@ -151,14 +153,15 @@ def test_gpu_model_runner_binding_stage(monkeypatch):
     class DummyFusedMoE:
         def __init__(self):
             self.layer_id = 11
+            self.sp_size = 1
             self.router = _make_router()
 
     class DummyCapturer:
         def __init__(self):
             self.calls = []
 
-        def capture(self, layer_id, topk_ids):
-            self.calls.append((layer_id, topk_ids))
+        def capture(self, layer_id, topk_ids, sp_size=1):
+            self.calls.append((layer_id, topk_ids, sp_size))
 
     dummy_module = DummyFusedMoE()
 
@@ -240,3 +243,73 @@ def test_routed_experts_capturer_dp_unexpected_batch_raises():
     ):
         capturer.capture(layer_id=0, topk_ids=topk)
     assert capturer._device_buffer[0, 0, 0].item() == -1
+
+
+def _build_sp_padded_topk(counts, sp_size):
+    """Producer model: each DP rank's t_r tokens then zero-tail-pad to round_up(t,sp),
+    blocks concatenated in DP-major order. Row value = rank*100 + idx (pad rows = -9)."""
+    rows = []
+    for r, t in enumerate(counts):
+        padded = sp_size * ((t + sp_size - 1) // sp_size)
+        rows += [[r * 100 + i, r * 100 + i] for i in range(t)]
+        rows += [[-9, -9]] * (padded - t)
+    return torch.tensor(rows, dtype=torch.int32)
+
+
+def test_routed_experts_capturer_dp_sp_padded_gather():
+    """n == sum(round_up(t_r, sp_size)): SP-MoE gather with per-rank tail padding.
+    Each rank's real tokens are the first token_num_per_dp rows of its padded block."""
+    sp_size = 2
+    counts = [2, 3, 3, 4]  # padded -> [2, 4, 4, 4] = 14 gathered rows (unpadded 12)
+    topk = _build_sp_padded_topk(counts, sp_size)
+    assert topk.shape[0] == 14
+    ctx = SimpleNamespace(
+        dp_metadata=SimpleNamespace(
+            num_tokens_across_dp_cpu=torch.tensor(counts, dtype=torch.int32)
+        )
+    )
+    for r, t in enumerate(counts):
+        cap = _capturer_with_buffer(max_tokens=8, dp_rank=r)
+        with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+            cap.capture(layer_id=0, topk_ids=topk, sp_size=sp_size)
+        want = torch.tensor(
+            [[r * 100 + i, r * 100 + i] for i in range(t)], dtype=torch.int32
+        )
+        assert torch.equal(cap._device_buffer[:t, 0, :], want), f"rank {r}"
+
+
+def test_routed_experts_capturer_sp_odd_ranks_5399_analog():
+    """Regression for the observed crash: several odd-count ranks pad by +1 each
+    (the 5399->5404 shape in miniature)."""
+    sp_size = 2
+    counts = [3, 4, 3, 4, 3]  # 3 odd ranks -> padded [4,4,4,4,4]=20 (unpadded 17, +3)
+    topk = _build_sp_padded_topk(counts, sp_size)
+    assert topk.shape[0] == 20 and sum(counts) == 17
+    ctx = SimpleNamespace(
+        dp_metadata=SimpleNamespace(
+            num_tokens_across_dp_cpu=torch.tensor(counts, dtype=torch.int32)
+        )
+    )
+    for r, t in enumerate(counts):
+        cap = _capturer_with_buffer(max_tokens=8, dp_rank=r)
+        with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+            cap.capture(layer_id=0, topk_ids=topk, sp_size=sp_size)
+        want = torch.tensor(
+            [[r * 100 + i, r * 100 + i] for i in range(t)], dtype=torch.int32
+        )
+        assert torch.equal(cap._device_buffer[:t, 0, :], want), f"rank {r}"
+
+
+def test_routed_experts_capturer_sp_padded_unexpected_raises():
+    """SP path: a batch dim matching neither total, local, nor padded -> fail loud."""
+    cap = _capturer_with_buffer(dp_rank=0)
+    num_tokens_dp = torch.tensor([2, 3], dtype=torch.int32)  # total 5, padded(sp2) 6
+    ctx = SimpleNamespace(
+        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=num_tokens_dp)
+    )
+    topk = torch.zeros((7, 2), dtype=torch.int32)  # 7 matches none of 5 / 2 / 6
+    with (
+        patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx),
+        pytest.raises(AssertionError, match="unexpected topk_ids batch dim"),
+    ):
+        cap.capture(layer_id=0, topk_ids=topk, sp_size=2)

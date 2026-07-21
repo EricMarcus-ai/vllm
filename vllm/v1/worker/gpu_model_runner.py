@@ -6569,8 +6569,13 @@ class GPUModelRunner(
             if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
                 layer_id = module.layer_id
 
-                def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
-                    _capturer.capture(_layer_id, topk_ids)
+                def _capture_fn(
+                    topk_ids,
+                    _layer_id=layer_id,
+                    _capturer=capturer,
+                    _sp_size=module.sp_size,
+                ):
+                    _capturer.capture(_layer_id, topk_ids, sp_size=_sp_size)
 
                 module.router.set_capture_fn(_capture_fn)
 

@@ -159,13 +159,17 @@ class RoutedExpertsCapturer:
             shape,
         )
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+    def capture(
+        self, layer_id: int, topk_ids: torch.Tensor, sp_size: int = 1
+    ) -> None:
         """
         Capture expert routing decisions for a specific layer.
 
         Args:
             layer_id: The layer index.
             topk_ids: Tensor of shape (batch_size, num_routed_experts).
+            sp_size: sequence-parallel size for SP-MoE token padding (tp_size when
+                use_sequence_parallel_moe is active, else 1).
         """
         if self._device_buffer is None:
             raise RuntimeError("Buffer not initialized. Call init_buffer() first.")
@@ -192,11 +196,25 @@ class RoutedExpertsCapturer:
                 start_loc = 0
                 end_loc = token_num_per_dp
             else:
-                raise AssertionError(
-                    "RoutedExpertsCapturer: unexpected topk_ids batch dim "
-                    f"{n} (expected {total} or {token_num_per_dp} "
-                    f"for dp_rank={self.dp_rank})"
+                # SP-MoE gather: each DP rank's tokens are zero-tail-padded to a
+                # multiple of sp_size (=tp_size) before the DP-major all-gather, so
+                # rank r's real tokens are the first token_num_per_dp rows of its
+                # round_up(t, sp_size) block. Degenerates to the n==total case at sp=1.
+                padded_per_dp = sp_size * ((num_tokens_dp + sp_size - 1) // sp_size)
+                expected_n = int(padded_per_dp.sum().item())
+                if n != expected_n:
+                    raise AssertionError(
+                        "RoutedExpertsCapturer: unexpected topk_ids batch dim "
+                        f"{n} (expected {total}, {token_num_per_dp}, or {expected_n} "
+                        f"for dp_rank={self.dp_rank}, sp_size={sp_size})"
+                    )
+                cumsum_padded = torch.cumsum(padded_per_dp, dim=0)
+                start_loc = (
+                    0
+                    if self.dp_rank == 0
+                    else int(cumsum_padded[self.dp_rank - 1].item())
                 )
+                end_loc = start_loc + token_num_per_dp
 
         if layer_id >= self._device_buffer.shape[1]:
             return
