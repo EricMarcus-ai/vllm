@@ -6538,16 +6538,14 @@ class GPUModelRunner(
         )
         routed_experts_capturer = RoutedExpertsCapturer.create()
         self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
-        min_block_size = min(
-            [
-                group.kv_cache_spec.block_size
-                for group in self.kv_cache_config.kv_cache_groups
-            ]
-        )
-        num_groups = len(self.kv_cache_config.kv_cache_groups)
-        self.max_num_kv_tokens = (
-            self.kv_cache_config.num_blocks // num_groups
-        ) * min_block_size
+        # Patched per vllm#40692: original sized buffer by num_blocks//num_groups,
+        # which under-allocates because block IDs come from a single shared pool
+        # spanning [0, num_blocks). Use the attention group's block_size and the
+        # full num_blocks so slot_mapping indices stay in bounds.
+        attn_block_size = self.kv_cache_config.kv_cache_groups[
+            self.routed_experts_attn_gid
+        ].kv_cache_spec.block_size
+        self.max_num_kv_tokens = self.kv_cache_config.num_blocks * attn_block_size
         dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
         pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
         if pcp_size * dcp_size > 1:
