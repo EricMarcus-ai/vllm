@@ -313,3 +313,35 @@ def test_routed_experts_capturer_sp_padded_unexpected_raises():
         pytest.raises(AssertionError, match="unexpected topk_ids batch dim"),
     ):
         cap.capture(layer_id=0, topk_ids=topk, sp_size=2)
+
+
+@pytest.mark.parametrize(
+    "np_per_rank, expect_padded",
+    [(5, True), (6, False)],  # odd -> SP branch fires; even -> degenerates to n==total
+)
+def test_routed_experts_capturer_cudagraph_dummy_run_uniform(np_per_rank, expect_padded):
+    """Cudagraph capture drives every DP rank with the SAME num_tokens (lockstep), so
+    the capturer sees uniform counts. When np_per_rank is a multiple of sp_size the
+    gather has no padding (n == total, naive branch); otherwise every rank pads equally
+    (SP branch). Both must recover each rank's real rows -> C covers graph capture, so
+    R3 needs no enforce_eager. Mirrors forward_context._compute_sp_num_tokens."""
+    sp_size = 2
+    dp = 4
+    counts = [np_per_rank] * dp
+    topk = _build_sp_padded_topk(counts, sp_size)
+    total = dp * np_per_rank
+    padded_total = dp * sp_size * ((np_per_rank + sp_size - 1) // sp_size)
+    assert (topk.shape[0] == padded_total) and ((padded_total != total) == expect_padded)
+    ctx = SimpleNamespace(
+        dp_metadata=SimpleNamespace(
+            num_tokens_across_dp_cpu=torch.tensor(counts, dtype=torch.int32)
+        )
+    )
+    for r in range(dp):
+        cap = _capturer_with_buffer(max_tokens=16, dp_rank=r)
+        with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+            cap.capture(layer_id=0, topk_ids=topk, sp_size=sp_size)
+        want = torch.tensor(
+            [[r * 100 + i, r * 100 + i] for i in range(np_per_rank)], dtype=torch.int32
+        )
+        assert torch.equal(cap._device_buffer[:np_per_rank, 0, :], want), f"rank {r}"
